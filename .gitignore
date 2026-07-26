@@ -1,0 +1,27 @@
+# OS
+.DS_Store
+
+# Python virtualenv
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Build output
+build/
+dist/
+.cache/
+
+# Shopify
+.shopify/
