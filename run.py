@@ -61,6 +61,11 @@ class Config:
     head_hue_tol: float = 12.0     # hue window used to isolate one arrow's own colour
     # FR-1 square (NO crop — mask interior only)
     roi_min_area_frac: float = 0.10
+    # frames drawn INSIDE the square (package / ball-array outline) are not
+    # measurement lines: a closed loop covering this much of the square is one
+    outline_min_area: float = 0.12   # fraction of the square's area
+    outline_rect_fill: float = 0.90  # a frame fills its own bounding box; a
+                                     # tangle of crossing leaders does not
     square_margin: int = 14        # inward margin from the border line (px)
     # FR-5 reference
     reference_strategy: str = "nearest_center"
@@ -72,8 +77,10 @@ class Config:
     calib_axis: str = "width"      # 'width' or 'height' of the square
     calib_pixels: float = 845.0    # used only when auto_calibrate is False
     calib_mm: float = 11.0
-    # filled in by adapt_parameters(): median dot radius, the pipeline's length unit
+    # filled in by adapt_parameters(): median dot radius (the pipeline's length
+    # unit) and the median centre-to-centre spacing of neighbouring dots
     dot_radius: Optional[float] = None
+    dot_pitch: Optional[float] = None
 
     @property
     def r0(self) -> float:
@@ -176,27 +183,50 @@ def adapt_parameters(bgr, mask, cfg):
     if not cfg.adaptive:
         return
     blobs = _nonwhite_mask(bgr, cfg) & mask
-    cnts, _ = cv2.findContours(blobs, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # RETR_LIST, not RETR_EXTERNAL: a drawing may carry an inner outline (package
+    # / ball-array border) that ENCLOSES the dots. Under RETR_EXTERNAL every dot
+    # is a nested child of that outline and is silently dropped — the whole grid
+    # would go undetected. The filters below reject the outline itself anyway.
+    cnts, _ = cv2.findContours(blobs, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     area_floor = 0.00002 * mask.size            # ignore specks, relative to image size
-    radii = []
+    radii, centers = [], []
     for c in cnts:
         a = cv2.contourArea(c)
         if a < area_floor:
             continue
-        (_, _), r = cv2.minEnclosingCircle(c)
+        (cx, cy), r = cv2.minEnclosingCircle(c)
         if r > 0 and a / (np.pi * r * r) > 0.7:  # round -> a dot (not a line/arrowhead)
             radii.append(r)
+            centers.append((cx, cy))
     if len(radii) < 5:                          # not enough evidence; keep defaults
         return
     r0 = float(np.median(radii))
     cfg.dot_radius = r0
+    # Dot PITCH, not just dot size: on a fine-pitch grid a stroke is interrupted
+    # at every dot it crosses, and Hough has to jump those blanks or the line
+    # comes back shattered into fragments too short to reconstruct.
+    if len(centers) >= 5:
+        p = np.asarray(centers, float)
+        step = 2048                                   # chunked: grids can be huge
+        nn = []
+        for i in range(0, len(p), step):
+            d = np.linalg.norm(p[i:i + step, None, :] - p[None, :, :], axis=2)
+            np.fill_diagonal(d[:, i:i + step], np.inf)
+            nn.append(d.min(1))
+        cfg.dot_pitch = float(np.median(np.concatenate(nn)))
     odd = lambda k: max(3, int(k) | 1)
     cfg.min_radius = max(3, int(0.45 * r0))
     cfg.max_radius = int(2.6 * r0)
     cfg.min_blob_area = int(0.30 * np.pi * r0 * r0)
-    cfg.open_ksize = odd(round(0.55 * r0))      # > line width, < dot diameter
+    # The opening must DESTROY strokes but KEEP dots, so the kernel has to be
+    # wider than any line yet still fit inside a dot. 0.55*r0 is too timid on
+    # fine-pitch drawings (r0~7 -> a 5px ellipse still fits inside a 3px line,
+    # so no line is ever removed and arrow detection sees nothing). Sit just
+    # under the dot radius instead, which scales safely in both directions.
+    cfg.open_ksize = odd(min(round(0.9 * r0), 2 * r0 - 3))
     cfg.min_line_length = int(3.0 * r0)
-    cfg.arrow_max_gap = int(4.0 * r0)           # jump over a dot + gap along a shaft
+    # jump over a dot + the blank to the next stroke fragment
+    cfg.arrow_max_gap = int(max(4.0 * r0, 1.4 * (cfg.dot_pitch or 0.0)))
     cfg.arrow_extend = int(1.6 * r0)
     cfg.arrow_rho_tol = max(8.0, 1.1 * r0)
     cfg.line_tolerance = max(4, int(0.55 * r0))
@@ -219,7 +249,7 @@ def detect_circles(bgr, mask, cfg) -> List[Circle]:
     blob = cv2.morphologyEx(blob, cv2.MORPH_OPEN,
                             cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                                       (cfg.open_ksize, cfg.open_ksize)))
-    cnts, _ = cv2.findContours(blob, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnts, _ = cv2.findContours(blob, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)  # see adapt_parameters
 
     raw = []
     for c in cnts:
@@ -240,7 +270,44 @@ def detect_circles(bgr, mask, cfg) -> List[Circle]:
     return out
 
 
-def detect_arrows(bgr, mask, cfg):
+def detect_outlines(bgr, mask, cfg, square_bbox):
+    """Strokes belonging to a closed FRAME (package outline, ball-array border).
+
+    A drawing often carries rectangles *inside* the detected square. They are
+    long straight coloured strokes, so arrow detection happily reports each side
+    as a measurement line and invents a whole reference group from them. A
+    measurement leader is an open stroke; a frame is a closed loop enclosing a
+    big share of the square, which is what separates them here — a long, thin
+    dimension line covers a fraction of a percent of that area.
+
+    Returns a mask of those frame strokes, to be subtracted before Hough.
+    """
+    H, W = mask.shape
+    out = np.zeros((H, W), np.uint8)
+    sq_area = max(1.0, float(square_bbox[2] * square_bbox[3]))
+    nonwhite = _nonwhite_mask(bgr, cfg)
+    cnts, _ = cv2.findContours(nonwhite, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if area < cfg.outline_min_area * sq_area:
+            continue
+        x, y, w, h = cv2.boundingRect(c)
+        # A rectangular frame fills its own bounding box (~1.0). A knot of
+        # crossing dimension lines spans a big box but fills far less of it,
+        # which is what keeps real leaders out of this mask.
+        if area / max(1.0, float(w * h)) < cfg.outline_rect_fill:
+            continue
+        # Paint the four straight sides, NOT the contour path: where a leader
+        # crosses the frame the contour detours along that leader, and following
+        # it would erase the leader over its whole length.
+        # The band must be wide enough to swallow the whole frame stroke: the
+        # bounding box hugs its OUTER edge, so a hairline band leaves the inner
+        # half behind and Hough still finds a line there.
+        cv2.rectangle(out, (x, y), (x + w, y + h), 255, max(5, int(cfg.r0)))
+    return out
+
+
+def detect_arrows(bgr, mask, cfg, square_bbox=None):
     """FR-3: extract each measurement arrow as a full connected stroke.
 
     Colour strokes (arrows) and filled dots are both saturated, so we isolate
@@ -258,6 +325,8 @@ def detect_arrows(bgr, mask, cfg):
                             cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                                       (cfg.open_ksize, cfg.open_ksize)))
     thin = cv2.subtract(colored, cv2.dilate(dots, np.ones((3, 3), np.uint8)))
+    if square_bbox is not None:                # drop package / array frames
+        thin = cv2.subtract(thin, detect_outlines(bgr, mask, cfg, square_bbox))
 
     # Hough on the thin strokes; big gap jumps over the dots each arrow crosses
     segs = cv2.HoughLinesP(thin, 1, np.pi / 180, threshold=40,
@@ -631,7 +700,7 @@ def process_image(image_path, cfg):
     elif cfg.auto_calibrate and cfg.square_real_mm is None:
         cfg.calib_pixels = 0.0                     # no mm conversion requested
     circles = detect_circles(img, mask, cfg)      # FR-2
-    arrows = detect_arrows(img, mask, cfg)        # FR-3: colour-stroke arrows (+ real colour)
+    arrows = detect_arrows(img, mask, cfg, bbox)  # FR-3: colour-stroke arrows (+ real colour)
     groups = group_arrows_by_color(arrows, cfg)   # merge same-colour parallel pairs
     flag_measured(circles, arrows, groups, cfg)   # FR-4 (records reference number)
     ends = detect_line_ends(img, mask, arrows, cfg)              # FR-4b
