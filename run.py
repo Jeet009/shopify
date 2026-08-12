@@ -38,8 +38,10 @@ class Config:
     min_blob_area: int = 220
     min_circularity: float = 0.55   # 1.0 = perfect disc; drops arrowheads (scale-free)
     open_ksize: int = 7             # morphological opening kernel (removes lines)
-    white_val: int = 180           # HSV V above this + low S == white background (scale-free)
-    white_sat: int = 60
+    # Background is MEASURED per image (see estimate_background); these only
+    # bound the automatic threshold on distance-to-background.
+    bg_tol_min: float = 25.0
+    bg_tol_max: float = 120.0
     # FR-3 arrow (colour-stroke) detection
     min_line_length: int = 120     # min extent (px) for a stroke to count as an arrow
     arrow_max_gap: int = 55        # Hough gap to jump over dots along a shaft
@@ -48,6 +50,9 @@ class Config:
     arrow_extend: int = 30         # extend each arrow past its ends to reach the head
     color_group_tol: float = 14.0  # hue tol: same-colour arrows = one reference group (scale-free)
     row_bin: int = 60              # px band used to order rows top->bottom
+    # an "arrow" this much shorter than the longest one of its colour is a
+    # fragment of it (an arrowhead barb), not a measurement of its own
+    arrow_min_len_frac: float = 0.20
     # FR-4 proximity
     line_tolerance: int = 10
     # FR-4b arrow END (head) detection — the dot an arrow actually points at
@@ -58,6 +63,9 @@ class Config:
     # the dot or overshoot it. Keep below ~half the dot pitch, otherwise a line
     # dying in open space would claim the dot next to it.
     end_circle_tol: float = 1.0
+    # a "terminal" with more of the same stroke ahead of it is a break, not an end
+    continuation_scan: float = 1.6   # how far ahead to look (x max(3*r0, pitch))
+    continuation_hits: int = 3       # samples of stroke ahead that prove it goes on
     head_hue_tol: float = 12.0     # hue window used to isolate one arrow's own colour
     # FR-1 square (NO crop — mask interior only)
     roi_min_area_frac: float = 0.10
@@ -81,6 +89,9 @@ class Config:
     # unit) and the median centre-to-centre spacing of neighbouring dots
     dot_radius: Optional[float] = None
     dot_pitch: Optional[float] = None
+    # measured per image; reset by process_image() so a Config can be reused
+    background: Optional[Tuple[float, float, float]] = None
+    bg_tol: Optional[float] = None
 
     @property
     def r0(self) -> float:
@@ -125,10 +136,10 @@ def detect_square(bgr, cfg):
     is 255 strictly inside the border (inward margin excludes the border line).
     """
     H, W = bgr.shape[:2]
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    # everything that is not white background (border, dots, arrows, text)
-    nw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1] > 0
+    # everything that is not background (border, dots, arrows, text). Uses the
+    # estimated background rather than assuming dark-ink-on-light-paper, so a
+    # dark-themed or colour-cast drawing gives the same border.
+    nw = _nonwhite_mask(cv2.GaussianBlur(bgr, (3, 3), 0), cfg) > 0
 
     def longest_run(vec):
         idx = np.where(vec)[0]
@@ -167,10 +178,43 @@ def detect_square(bgr, cfg):
     return best, mask
 
 
+def estimate_background(bgr, cfg):
+    """The drawing's background colour, whatever it is.
+
+    Assuming a WHITE background breaks on anything that is not one: a scan with
+    a colour cast, a photographed screen, a dark theme. The background is
+    instead the colour that covers the most area — true of any drawing, since
+    the paper outweighs the ink. A coarse colour histogram finds that mode, then
+    the exact shade is averaged from the pixels in the winning bin.
+    """
+    if cfg.background is not None:
+        return cfg.background
+    q = (bgr // 16).astype(np.int32)                  # 16 levels per channel
+    key = (q[:, :, 0] * 256 + q[:, :, 1] * 16 + q[:, :, 2])
+    top = np.bincount(key.ravel(), minlength=16 ** 3).argmax()
+    cfg.background = tuple(float(v) for v in bgr[key == top].mean(0))
+    return cfg.background
+
+
 def _nonwhite_mask(bgr, cfg):
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    val, sat = hsv[:, :, 2], hsv[:, :, 1]
-    return (~((val > cfg.white_val) & (sat < cfg.white_sat))).astype(np.uint8) * 255
+    """Foreground: everything that is not the background colour.
+
+    The cut is set from how much the background itself varies — its noise floor
+    — so it sits just above the paper and keeps every real stroke, faint or not.
+    Otsu is wrong here: the background dominates the histogram and drags the
+    threshold up until mid-contrast ink (a frame line, say) is read as paper,
+    which loses the drawing border while the brightest dots still survive.
+    """
+    bg = np.array(estimate_background(bgr, cfg), np.float32)
+    dist = np.linalg.norm(bgr.astype(np.float32) - bg, axis=2)
+    dist8 = np.clip(dist, 0, 255).astype(np.uint8)
+    if cfg.bg_tol is None:
+        base = dist8[dist8 <= np.percentile(dist8, 60)]      # certainly background
+        med = float(np.median(base))
+        mad = float(np.median(np.abs(base - med))) * 1.4826  # robust sigma
+        cfg.bg_tol = float(min(max(med + max(6.0 * mad, 10.0),
+                                   cfg.bg_tol_min), cfg.bg_tol_max))
+    return (dist8 > cfg.bg_tol).astype(np.uint8) * 255
 
 
 def adapt_parameters(bgr, mask, cfg):
@@ -241,11 +285,7 @@ def detect_circles(bgr, mask, cfg) -> List[Circle]:
     morphological opening; arrowheads are dropped by the circularity filter.
     Full-image coordinates (no cropping).
     """
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    val, sat = hsv[:, :, 2], hsv[:, :, 1]
-    # non-white = NOT (bright AND unsaturated)
-    nonwhite = ~((val > cfg.white_val) & (sat < cfg.white_sat))
-    blob = (nonwhite.astype(np.uint8) * 255) & mask
+    blob = _nonwhite_mask(bgr, cfg) & mask
     blob = cv2.morphologyEx(blob, cv2.MORPH_OPEN,
                             cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                                       (cfg.open_ksize, cfg.open_ksize)))
@@ -268,6 +308,24 @@ def detect_circles(bgr, mask, cfg) -> List[Circle]:
     for i, (x, y, r) in enumerate(sorted(raw, key=lambda t: (t[1], t[0])), start=1):
         out.append(Circle(id=i, x=x, y=y, r=r))
     return out
+
+
+def strokes_and_dots(bgr, mask, cfg, square_bbox=None):
+    """Split the coloured content into (everything, THIN strokes only).
+
+    Dots and strokes are both saturated, so they are separated by shape: a
+    morphological opening keeps whatever a dot-sized disc fits inside (the dots)
+    and destroys the strokes; subtracting that leaves shafts and arrowheads.
+    Frames drawn inside the square are removed too — they are not measurements.
+    """
+    colored = _nonwhite_mask(bgr, cfg) & mask
+    dots = cv2.morphologyEx(colored, cv2.MORPH_OPEN,
+                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                                      (cfg.open_ksize, cfg.open_ksize)))
+    thin = cv2.subtract(colored, cv2.dilate(dots, np.ones((3, 3), np.uint8)))
+    if square_bbox is not None:
+        thin = cv2.subtract(thin, detect_outlines(bgr, mask, cfg, square_bbox))
+    return colored, thin
 
 
 def detect_outlines(bgr, mask, cfg, square_bbox):
@@ -317,16 +375,7 @@ def detect_arrows(bgr, mask, cfg, square_bbox=None):
     top->bottom, left->right for stable numbering (A1..An).
     """
     H, W = mask.shape
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    val, sat = hsv[:, :, 2], hsv[:, :, 1]
-    colored = ((~((val > cfg.white_val) & (sat < cfg.white_sat))).astype(np.uint8) * 255) & mask
-    # keep only THIN structures: subtract whatever survives an opening (= the dots)
-    dots = cv2.morphologyEx(colored, cv2.MORPH_OPEN,
-                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                                      (cfg.open_ksize, cfg.open_ksize)))
-    thin = cv2.subtract(colored, cv2.dilate(dots, np.ones((3, 3), np.uint8)))
-    if square_bbox is not None:                # drop package / array frames
-        thin = cv2.subtract(thin, detect_outlines(bgr, mask, cfg, square_bbox))
+    colored, thin = strokes_and_dots(bgr, mask, cfg, square_bbox)
 
     # Hough on the thin strokes; big gap jumps over the dots each arrow crosses
     segs = cv2.HoughLinesP(thin, 1, np.pi / 180, threshold=40,
@@ -387,6 +436,7 @@ def detect_arrows(bgr, mask, cfg, square_bbox=None):
         color = tuple(int(v) for v in np.median(bgr[ys, xs], axis=0)) if len(xs) else (0, 0, 0)
         arrows.append({"mask": m, "core": core, "dir": dirv, "color": color})
 
+    arrows = _drop_duplicate_arrows(arrows, cfg)
     arrows.sort(key=lambda a: (round(np.where(a["mask"] > 0)[0].mean() / cfg.row_bin),
                                np.where(a["mask"] > 0)[1].mean()))
     return arrows
@@ -422,19 +472,67 @@ def _stroke_pixels(colored, hue, mask, arrow, cfg):
     if len(xs) < 10:
         return None, None, None
     pts = np.stack([xs, ys], 1).astype(float)
-    d = np.asarray(arrow["dir"], float)
-    d = d / (np.linalg.norm(d) + 1e-9)
-    c = pts.mean(0)
-    # a same-colour blob merely brushing the shaft sideways must not widen it
-    near = np.abs((pts - c) @ np.array([-d[1], d[0]])) < 2.5 * r0
+
+    # Trim to THIS arrow's corridor first. Strokes touch each other — two
+    # parallel leaders joined by the dimension line they share end up in one
+    # connected component — so without the trim the axis below would be fitted
+    # to both at once and land between them, off either line.
+    ay, ax = np.where(arrow["mask"] > 0)
+    a_c = np.array([ax.mean(), ay.mean()])
+    a_d = np.asarray(arrow["dir"], float)
+    a_d = a_d / (np.linalg.norm(a_d) + 1e-9)
+    near = np.abs((pts - a_c) @ np.array([-a_d[1], a_d[0]])) < 2.5 * r0
     if near.sum() < 10:
         return None, None, None
+    pts, ys, xs = pts[near], ys[near], xs[near]
+
+    # Then refine the axis on those pixels. Hough often carves an arrowhead into
+    # extra stub "arrows" whose own direction is meaningless; refitting keeps a
+    # stub from projecting its parent stroke onto a bogus axis, which would put
+    # a phantom terminal in the middle of the line.
+    c = pts.mean(0)
+    d = np.linalg.svd(pts - c)[2][0]
+    d = d / (np.linalg.norm(d) + 1e-9)
+    if abs(float(np.dot(d, a_d))) < 0.87:      # >30 deg off: the fit is unstable
+        d = a_d
     out = np.zeros((H, W), np.uint8)
-    out[ys[near], xs[near]] = 255
+    out[ys, xs] = 255
     return out, c, d
 
 
-def detect_line_ends(bgr, mask, arrows, cfg):
+def _continues_past(thin_hue, p_end, d, cfg):
+    """Does the STROKE carry on beyond this terminal?
+
+    Every dot a line crosses interrupts it, so a line can come back as several
+    fragments and a fragment's break looks exactly like an ending. Looking past
+    the terminal settles it: if more of the same stroke lies ahead, this is a
+    break, not an end.
+
+    The search runs over THIN pixels only, so a same-coloured DOT sitting beyond
+    a genuine arrowhead is not mistaken for the line continuing.
+    """
+    H, W = thin_hue.shape
+    step = max(2.0, 0.3 * cfg.r0)
+    reach = cfg.continuation_scan * max(cfg.r0 * 3.0, cfg.dot_pitch or 0.0)
+    hits = 0
+    s = max(1.5 * cfg.r0, step)                 # skip the terminal blob itself
+    while s <= reach:
+        p = p_end + d * s
+        x, y = int(round(p[0])), int(round(p[1]))
+        if not (0 <= x < W and 0 <= y < H):
+            break
+        # a small window: the stroke may drift a pixel or two off the fitted axis
+        lo_y, hi_y = max(0, y - 2), min(H, y + 3)
+        lo_x, hi_x = max(0, x - 2), min(W, x + 3)
+        if thin_hue[lo_y:hi_y, lo_x:hi_x].any():
+            hits += 1
+            if hits >= cfg.continuation_hits:
+                return True
+        s += step
+    return False
+
+
+def detect_line_ends(bgr, mask, arrows, cfg, square_bbox=None):
     """FR-4b: where does each line STOP inside the square?
 
     For every stroke this returns its terminals — the arrowhead tip when the line
@@ -450,9 +548,9 @@ def detect_line_ends(bgr, mask, arrows, cfg):
     # distance to the outside of the square: ~0 exactly on the border line
     dt_edge = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
     H, W = mask.shape
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    val, sat, hue = hsv[:, :, 2], hsv[:, :, 1], hsv[:, :, 0].astype(np.int16)
-    colored = (~((val > cfg.white_val) & (sat < cfg.white_sat))) & (mask > 0)
+    hue = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[:, :, 0].astype(np.int16)
+    colored = (_nonwhite_mask(bgr, cfg) > 0) & (mask > 0)
+    _, thin = strokes_and_dots(bgr, mask, cfg, square_bbox)
     for idx, a in enumerate(arrows):
         stroke, c, d = _stroke_pixels(colored, hue, mask, a, cfg)
         if stroke is None:
@@ -472,6 +570,11 @@ def detect_line_ends(bgr, mask, arrows, cfg):
         cand = []
         for sign, t_end in ((+1.0, hi), (-1.0, lo)):
             p_end = c + d * t_end
+            # Where the stroke really stops. The border test must use THIS, not
+            # the arrowhead position below: a line leaving the square just after
+            # crossing a dot would otherwise look like it ended on that dot.
+            xr, yr = int(round(p_end[0])), int(round(p_end[1]))
+            edge = float(dt_edge[min(max(yr, 0), H - 1), min(max(xr, 0), W - 1)])
             # A blob thicker than the shaft just inside the terminal is an
             # arrowhead (or the dot the line dies on) — aim at its middle rather
             # than at the extreme pixel, which can overshoot past the dot.
@@ -486,8 +589,7 @@ def detect_line_ends(bgr, mask, arrows, cfg):
             x, y = int(round(p_end[0])), int(round(p_end[1]))
             x, y = min(max(x, 0), W - 1), min(max(y, 0), H - 1)
             cand.append({"p": (x, y), "t": t_end, "c": c, "d": d, "arrow": idx,
-                         "head": head, "thick": float(thick[y, x]),
-                         "edge": float(dt_edge[y, x])})
+                         "head": head, "thick": float(thick[y, x]), "edge": edge})
 
         # Both ends thick and both plausible -> we cannot tell head from tail;
         # that is fine, an unarrowed line simply has two equal endings.
@@ -497,10 +599,24 @@ def detect_line_ends(bgr, mask, arrows, cfg):
                 for e in cand:
                     e["head"] = False
 
-        for e in cand:
-            if e["edge"] > 0.8 * r0:          # a real ending, not the border crossing
-                ends.append(e)
-    return ends
+        dh = np.abs(hue - _bgr_hue(a["color"]))
+        thin_hue = (thin > 0) & (np.minimum(dh, 180 - dh) < cfg.head_hue_tol)
+        for sign, e in zip((+1.0, -1.0), cand):
+            if e["edge"] <= 0.8 * r0:         # the line only leaves the square here
+                continue
+            if _continues_past(thin_hue, np.asarray(e["p"], float), d * sign, cfg):
+                continue                      # a dot broke the line; not an ending
+            ends.append(e)
+
+    # Several Hough stubs can describe one stroke and report the same terminal;
+    # keep one per location so a single ending is not counted repeatedly.
+    merge = max(r0, 0.5 * (cfg.dot_pitch or 0.0))
+    unique = []
+    for e in ends:
+        if any(np.hypot(e["p"][0] - u["p"][0], e["p"][1] - u["p"][1]) <= merge for u in unique):
+            continue
+        unique.append(e)
+    return unique
 
 
 def flag_line_ends(circles, ends, arrow_group, cfg):
@@ -534,6 +650,47 @@ def flag_line_ends(circles, ends, arrow_group, cfg):
                 best.arrow = gnum
             e["circle"] = best.id
     return ends
+
+
+def _drop_duplicate_arrows(arrows, cfg):
+    """Discard arrows that are only a piece of a longer one.
+
+    Hough tends to carve an arrowhead — or a stretch of shaft between two dots —
+    into extra short "arrows" lying inside the leader they came from. They add
+    no measurement, and each one reports its own terminals, so a leader would be
+    credited with endings it does not have. A stroke that lies inside a longer
+    arrow's corridor is that arrow, not a new one.
+    """
+    if len(arrows) < 2:
+        return arrows
+    for a in arrows:
+        ys, xs = np.where(a["mask"] > 0)
+        a["_len"] = float(np.hypot(xs.max() - xs.min(), ys.max() - ys.min()))
+    k = max(3, int(2 * cfg.r0) | 1)
+    band = np.ones((k, k), np.uint8)
+    kept = []
+    for a in sorted(arrows, key=lambda z: -z["_len"]):
+        m = a["mask"] > 0
+        n = int(m.sum())
+        if n and any(b["_len"] > 1.5 * a["_len"]
+                     and (m & (cv2.dilate(b["mask"], band) > 0)).sum() > 0.8 * n
+                     for b in kept):
+            continue
+        # The barbs of an arrowhead splay out of the shaft, so the corridor test
+        # above misses them, but they stay a small fraction of the leader they
+        # belong to. Parallel leaders of one colour are near-equal in length, so
+        # comparing within a colour is safe.
+        ah = _bgr_hue(a["color"])
+        peer = max((b["_len"] for b in arrows
+                    if min(abs(_bgr_hue(b["color"]) - ah),
+                           180 - abs(_bgr_hue(b["color"]) - ah)) < cfg.color_group_tol),
+                   default=a["_len"])
+        if a["_len"] < cfg.arrow_min_len_frac * peer:
+            continue
+        kept.append(a)
+    for a in kept:
+        a.pop("_len", None)
+    return kept
 
 
 def _bgr_hue(bgr):
@@ -689,6 +846,7 @@ def process_image(image_path, cfg):
     img = cv2.imread(image_path)
     if img is None:
         raise FileNotFoundError(image_path)
+    cfg.background, cfg.bg_tol = None, None        # measured per image
     # FR-1: detect square (any colour), build interior mask (NO crop)
     bbox, mask = detect_square(img, cfg)
     # Adaptive: derive all pixel thresholds from the detected dot/square size
@@ -703,7 +861,7 @@ def process_image(image_path, cfg):
     arrows = detect_arrows(img, mask, cfg, bbox)  # FR-3: colour-stroke arrows (+ real colour)
     groups = group_arrows_by_color(arrows, cfg)   # merge same-colour parallel pairs
     flag_measured(circles, arrows, groups, cfg)   # FR-4 (records reference number)
-    ends = detect_line_ends(img, mask, arrows, cfg)              # FR-4b
+    ends = detect_line_ends(img, mask, arrows, cfg, bbox)        # FR-4b
     flag_line_ends(circles, ends, arrow_group_map(groups), cfg)  # FR-4b
     # drop reference groups that touch no dots (pure dimension leaders); renumber 1..k
     used = sorted({n for c in circles for n in (c.arrow, c.end_arrow) if n})
